@@ -1,4 +1,7 @@
+.vscode/
 *.pyc
 *.vscode
 *.mp4
-.vscode/
+*.wav
+*.pt
+*.pth
