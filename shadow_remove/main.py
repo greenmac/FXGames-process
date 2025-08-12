@@ -2,17 +2,17 @@ from ultralytics import YOLO
 import cv2, numpy as np
 import mediapipe as mp
 
-model = YOLO("yolo11s-seg.pt")  # COCO 模式預訓練，包含 person 類別
+model = YOLO("yolo11s-seg.pt") # COCO model pre-training, including the person category
 
 def get_background_median(video_path, sample_size=200, max_frames=5000):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         cap.release()
-        raise ValueError(f"影片無法開啟: {video_path}")
+        raise ValueError(f"The video cannot be opened: {video_path}")
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if frame_count <= 0:
         cap.release()
-        raise ValueError(f"影片總幀數為 {frame_count}")
+        raise ValueError(f"The total number of frames in the video is {frame_count}")
 
     sample_n = min(frame_count, sample_size)
     try:
@@ -29,13 +29,13 @@ def get_background_median(video_path, sample_size=200, max_frames=5000):
     cap.release()
 
     if not frames:
-        raise ValueError("無法讀取任何參考畫面")
+        raise ValueError("Unable to read any reference images")
     return np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
 
 from ultralytics import YOLO
 import cv2, numpy as np
 
-# 載入 YOLOv11 instance segmentation 模型，COCO 預訓練已包含 person 類別
+# Load YOLOv11 instance segmentation model, COCO pre-training includes person category
 model = YOLO("yolo11s-seg.pt")
 
 def get_person_mask_yolo_seg(frame, conf=0.3):
