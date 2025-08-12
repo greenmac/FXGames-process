@@ -30,11 +30,29 @@ def main():
     output_path = get_folder_path('./data', source)
     
     text_list = [
-    #    'Please place your bets',
-    #    'No more bets',
-    #    'Banker 8 points Player 5 points',
-    #    'Banker wins'
-        'Banker 6 points Player 9 points',
+        'Please place your bets',
+        'No more bets',
+        'Banker 0 points',
+        'Banker 1 points',
+        'Banker 2 points',
+        'Banker 3 points',
+        'Banker 4 points',
+        'Banker 5 points',
+        'Banker 6 points',
+        'Banker 7 points',
+        'Banker 8 points',
+        'Banker 9 points',
+        'Player 0 points',
+        'Player 1 points',
+        'Player 2 points',
+        'Player 3 points',
+        'Player 4 points',
+        'Player 5 points',
+        'Player 6 points',
+        'Player 7 points',
+        'Player 8 points',
+        'Player 9 points',
+        'Banker wins',
         'Player wins',
     ]
 
