@@ -1,66 +1,136 @@
-# https://huggingface.co/hexgrad/Kokoro-82M
+# Kokoro-82M: https://huggingface.co/hexgrad/Kokoro-82M
+from audiomath import Sound
+from pathlib import Path
+from typing import List, Dict, Union
 from kokoro import KPipeline
 import soundfile as sf
-from utils_tool import get_folder_path
-from utils_tool import timer
+import audiomath as am
+from utils_tool import get_folder_path, timer
+import numpy as np
+import tempfile, os
 
-source = 'kokoro'
+'''
+Language code reference:
+'a'=American English, 'b'=British English, 'z'=Mandarin Chinese, 'j'=Japanese,
+'e'=Spanish, 'f'=French, 'h'=Hindi, 'i'=Italian, 'p'=Brazilian Portuguese
+'''
 
-def tts_offline(text: str, voice, output_file: str):
-    '''
-    'a' = American English  
-    'b' = British English  
-    'z' = Mandarin Chinese  
-    'j' = Japanese  
-    'e' = Spanish  
-    'f' = French  
-    'h' = Hindi  
-    'i' = Italian  
-    'p' = Brazilian Portuguese
-    '''
-    pipe = KPipeline(lang_code='a')
+def _silence_wav(path: Path, duration_sec: float, sr: int = 24000):
+    """Create a silent wav file with the specified duration (in seconds)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    silence = np.zeros(int(duration_sec * sr), dtype=np.float32)
+    sf.write(str(path), silence, sr)
 
-    gen = pipe(text, voice=voice, speed=1.0)
+def _safe_name(text: str) -> str:
+    """TitleCase + remove spaces (safe for filenames)."""
+    return text.title().replace(' ', '')
 
+def tts_offline(text: str, voice: str, output_file: Path, lang_code: str = 'a', speed: float = 1.0, sr: int = 24000):
+    """Synthesize a single utterance to a WAV file (no caching kept on disk)."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    pipe = KPipeline(lang_code=lang_code)
+    gen = pipe(text, voice=voice, speed=speed)
+
+    audio_chunks = []
     for _, (_, _, audio) in enumerate(gen):
-        sf.write(output_file, audio, 24000)
+        audio_chunks.append(audio)
+    audio_all = np.concatenate(audio_chunks) if len(audio_chunks) > 1 else audio_chunks[0]
+    sf.write(str(output_file), audio_all, sr)
 
+def _unit_wav_temp_path(tmp_dir: Path) -> Path:
+    """Create a unique temporary wav path inside tmp_dir."""
+    fd, name = tempfile.mkstemp(suffix=".wav", dir=str(tmp_dir))
+    os.close(fd)
+    return Path(name)
+
+def ensure_tts_file_for_item(item: Dict, voice: str, tmp_dir: Path) -> Path:
+    """
+    Always render this item into a fresh temporary wav and return that FILE path.
+    If text starts with 'Blank', create a 1-second silence wav instead of TTS.
+    """
+    text = item['text']
+    wav_path = _unit_wav_temp_path(tmp_dir)
+    if text.startswith("Blank"):
+        _silence_wav(wav_path, duration_sec=1.0)
+    else:
+        tts_offline(text, voice, wav_path)
+    return wav_path
+
+def build_segments_with_silence(clips: List[Sound], start_times: List[float]):
+    """
+    Given Sound objects and start times, return a list of segments for am.Concatenate,
+    automatically inserting silence (as float seconds) when needed.
+    """
+    segments = []
+    current_time = 0.0
+    for s, st in zip(clips, start_times):
+        if st > current_time:
+            segments.append(st - current_time)   # silence seconds
+            current_time = st
+        segments.append(s)
+        current_time += s.Duration()
+    return segments
+
+def make_tts_timeline(item_or_schedule: Union[Dict, List[Dict]], voice: str, out_wav: Path):
+    """
+    Accept either a single schedule item {'text': '...', 'start': 0.1}
+    or a full schedule [ {...}, {...}, ... ] and render a merged WAV.
+    All intermediate unit wavs are stored in a TemporaryDirectory and auto-deleted.
+    """
+    schedule = [item_or_schedule] if isinstance(item_or_schedule, dict) else item_or_schedule
+
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dir = Path(td)
+
+        wav_paths = [ensure_tts_file_for_item(it, voice, tmp_dir) for it in schedule]
+
+        clips = [Sound(str(p)) for p in wav_paths]
+        start_times = [float(it['start']) for it in schedule]
+
+        segments = build_segments_with_silence(clips, start_times)
+        final = am.Concatenate(*segments)
+        final.Write(str(out_wav))
+        
 @timer
 def main():
-    output_path = get_folder_path('./data', source)
-    
+    source = 'kokoro'
+    output_path = Path(get_folder_path('./data', source))
+
+    # If text starts with "Blank", a 1-second silence file will be created on the fly (no cache).
     text_list = [
-        'Please place your bets',
-        'No more bets',
-        'Banker 0 points',
-        'Banker 1 points',
-        'Banker 2 points',
-        'Banker 3 points',
-        'Banker 4 points',
-        'Banker 5 points',
-        'Banker 6 points',
-        'Banker 7 points',
-        'Banker 8 points',
-        'Banker 9 points',
-        'Player 0 points',
-        'Player 1 points',
-        'Player 2 points',
-        'Player 3 points',
-        'Player 4 points',
-        'Player 5 points',
-        'Player 6 points',
-        'Player 7 points',
-        'Player 8 points',
-        'Player 9 points',
-        'Banker wins',
-        'Player wins',
+        {'text': 'Banker 0 points',        'start': 0.1},
+        {'text': 'Banker 1 points',        'start': 0.1},
+        {'text': 'Banker 2 points',        'start': 0.1},
+        {'text': 'Banker 3 points',        'start': 0.1},
+        {'text': 'Banker 4 points',        'start': 0.1},
+        {'text': 'Banker 5 points',        'start': 0.1},
+        {'text': 'Banker 6 points',        'start': 0.1},
+        {'text': 'Banker 7 points',        'start': 0.1},
+        {'text': 'Banker 8 points',        'start': 0.1},
+        {'text': 'Banker 9 points',        'start': 0.1},
+        {'text': 'Player 0 points',        'start': 0.1},
+        {'text': 'Player 1 points',        'start': 0.1},
+        {'text': 'Player 2 points',        'start': 0.1},
+        {'text': 'Player 3 points',        'start': 0.1},
+        {'text': 'Player 4 points',        'start': 0.1},
+        {'text': 'Player 5 points',        'start': 0.1},
+        {'text': 'Player 6 points',        'start': 0.1},
+        {'text': 'Player 7 points',        'start': 0.1},
+        {'text': 'Player 8 points',        'start': 0.1},
+        {'text': 'Player 9 points',        'start': 0.1},
+        {'text': 'Please place your bets', 'start': 0.1},
+        {'text': 'No more bets',           'start': 4.0},
+        {'text': 'Good luck',              'start': 3.5},
+        {'text': 'Blank transition',       'start': 0.0},
     ]
 
     voice_list = [
         # 'af_heart',
         # 'af_alloy',
         # 'af_aoede',
-        'af_bella', # Recommend
+        'af_bella',  # Recommend
         # 'af_jessica',
         # 'af_kore',
         # 'af_nicole',
@@ -72,9 +142,9 @@ def main():
 
     for text in text_list:
         for voice in voice_list:
-            text_combination = text.title().replace(' ', '')
-            output_file = f"{output_path}/tts_{voice}_{text_combination}.wav"
-            tts_offline(text, voice, output_file)
-        
-if __name__ == "__main__":
+            text_combination = _safe_name(text['text'])
+            output_file = output_path / f"tts_{text_combination}.wav"
+            make_tts_timeline(text, voice, Path(output_file))
+
+if __name__ == '__main__':
     main()
