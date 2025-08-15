@@ -1,255 +1,342 @@
-# https://github.com/mowshon/lipsync
 from pathlib import Path
-import cv2
-import mediapipe as mp
-import numpy as np
-from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip, concatenate_audioclips
-from moviepy.audio.AudioClip import AudioClip
+from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips
+from moviepy import AudioClip
+from moviepy.audio.AudioClip import AudioArrayClip  # ★ 重要：用來精確寫出 numpy 組裝的音檔
 from lipsync import LipSync
 from utils_tool import timer
+import math
+import numpy as np
+import subprocess
 
-def detect_face_runs(video_path, min_conf=0.4, min_run_frames=3, fps_override=None):
-    """以 cv2 讀檔偵測臉部區段，回傳 [((t0, t1), has_face), ...] 與 fps"""
-    cap = cv2.VideoCapture(video_path)
-    fps_cv = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps_override or (fps_cv if fps_cv and fps_cv > 0 else 30.0)
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    det = mp.solutions.face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=min_conf
-    )
-    has = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        r = det.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        has.append(1 if r.detections else 0)
-    cap.release()
+def safe_subclip(clip, start, end, eps=1e-3):
+    """確保 end 不超過 clip.duration - eps"""
+    safe_end = min(end, clip.duration - eps)
+    safe_start = max(start, 0)
+    return clip.subclipped(safe_start, safe_end)
 
-    has = np.array(has, dtype=np.int32)
-    runs = []
+
+def _rms_db(x: np.ndarray, eps=1e-12) -> float:
+    """計算 RMS dBFS（mono 1D）。"""
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    rms = float(np.sqrt(np.mean(np.maximum(x**2, eps))))
+    return 20.0 * math.log10(max(rms, eps))
+
+def audio_has_speech(audio_path: str,
+                     sr: int = 16000,
+                     frame_ms: int = 30,
+                     hop_ms: int = 15,
+                     db_threshold: float = -45.0,
+                     min_speech_ratio: float = 0.10) -> bool:
+    """
+    粗略檢測音檔是否有語音：
+    - 將音訊轉為指定 sr 的 waveform（[-1, 1] 範圍）
+    - 分成 frame_ms 毫秒一幀
+    - 計算每幀 RMS dBFS，超過 db_threshold 視為有聲
+    - 有聲比例 >= min_speech_ratio 即視為有語音
+    """
+    with AudioFileClip(audio_path) as a:
+        y = a.to_soundarray(fps=sr)  # shape: (N, channels)
+    if y.ndim > 1:
+        y = y.mean(axis=1)  # 轉 mono
+    n = len(y)
+    if n == 0:
+        return False
+
+    frame_len = int(sr * frame_ms / 1000)
+    hop_len   = int(sr * hop_ms  / 1000)
+
+    num_frames = 0
+    speech_frames = 0
     i = 0
-    while i < len(has):
-        j = i
-        while j < len(has) and has[j] == has[i]:
-            j += 1
-        if j - i < min_run_frames:
-            if runs:
-                (t0, _), prev_has = runs[-1]
-                runs[-1] = ((t0, j / fps), prev_has)
-            else:
-                runs.append(((i / fps, j / fps), 0))
-        else:
-            runs.append(((i / fps, j / fps), int(has[i])))
-        i = j
-    return runs, fps
+    while i + frame_len <= n:
+        seg = y[i:i+frame_len]
+        db = _rms_db(seg)
+        if db > db_threshold:
+            speech_frames += 1
+        num_frames += 1
+        i += hop_len
 
-def _silent_audio(duration, fps=44100, nch=2):
-    """產生靜音 AudioClip（float32）"""
-    return AudioClip(lambda t: np.zeros((np.size(t), nch), dtype=np.float32),
-                     duration=duration, fps=fps)
+    ratio = speech_frames / max(1, num_frames)
+    return ratio >= min_speech_ratio
 
-@timer
-def lipsync_with_passthrough(
-    face_video: str,
-    audio_file: str,
-    output_file: str,
-    model_ckpt='weights/wav2lip.pth',
-    device='cuda',
-    img_size=96,
-    silence_sr=44100
-):
-    from math import isfinite
+def make_silence_wav_for_video(video_path: str, out_wav_path: str, sr: int = 44100):
+    """做一條與 video 等長的全靜音 WAV（供 Wav2Lip 驅動用）。"""
+    with VideoFileClip(video_path) as v:
+        dur = float(v.duration)
+    # 用 AudioArrayClip 產生精確靜音（不走函式型 AudioClip 避免浮點誤差）
+    target_samples = max(1, int(np.floor(dur * sr)))
+    arr = np.zeros((target_samples, 2), dtype=np.float32)
+    Path(out_wav_path).parent.mkdir(parents=True, exist_ok=True)
+    AudioArrayClip(arr, fps=sr).write_audiofile(out_wav_path, fps=sr, logger=None)
+    return out_wav_path
 
-    # 取得可靠 fps/時長
-    v = VideoFileClip(face_video)
-    orig_fps = getattr(v, "fps", None) or getattr(v.reader, "fps", None) or 30.0
-    vid_dur = float(v.duration)
-    eps_t = max(1e-4, 0.5 / float(orig_fps))  # 半格安全邊界
+def _get_video_props(path: str):
+    """Return (fps, (w, h)) using MoviePy."""
+    with VideoFileClip(path) as v:
+        fps = getattr(v, "fps", None) or getattr(v.reader, "fps", None) or 30.0
+        w, h = v.size
+    return fps, (w, h)
 
-    # 【新增】統一的高畫質 x264 參數（CRF 越小越清晰，檔案也越大）
-    # 建議 14~20；你可以先用 16，若檔案太大再調到 18 或 20
-    x264_hq = [
-        "-crf", "14",
-        "-preset", "slow",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "high",
-        "-level", "4.2",
-        "-vsync", "cfr", # 保持 CFR
-        "-g", str(int(orig_fps * 2)), # 合理的 GOP（1~2秒都可以），保留 B-frames 增加壓縮效率與畫質
-    ]
+def _ensure_same_resolution(src_video: str, candidate_video: str) -> str:
+    """
+    若 candidate 與 src 解析度不同就重採到一致，回傳修正後路徑。
+    """
+    _, (sw, sh) = _get_video_props(src_video)
+    _, (cw, ch) = _get_video_props(candidate_video)
+    if (sw, sh) == (cw, ch):
+        return candidate_video
 
-    # 臉部區段（時間以相同 fps 計）
-    runs, _ = detect_face_runs(face_video, min_conf=0.4, min_run_frames=3, fps_override=orig_fps)
-
-    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path("cache/segments")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    lip = LipSync(model='wav2lip', checkpoint_path=model_ckpt,
-                  nosmooth=True, device=device, cache_dir='cache',
-                  img_size=img_size, save_cache=True)
-
-    global_audio = AudioFileClip(audio_file)
-    aud_dur = float(global_audio.duration)
-
-    out_clips = []
-    seg_id = 0
-    total_frames = 0  # 以「重編碼後段落」的實際幀數累加
-
-    for (t0, t1), has_face in runs:
-        # clamp 邊界
-        t0 = max(0.0, min(t0, vid_dur))
-        t1 = max(0.0, min(t1, vid_dur))
-        if t1 <= t0:
-            continue
-
-        # 以 frame 對齊
-        n_frames = int(round((t1 - t0) * orig_fps))
-        if n_frames <= 0:
-            continue
-        target_dur = n_frames / orig_fps
-        t1_fixed = min(t0 + target_dur, vid_dur)
-
-        seg_id += 1
-
-        # 原片段（無音訊）—給 lipsync 用；【修改】高畫質輸出
-        seg_vid = v.subclipped(t0, t1_fixed)
-        seg_video_path = str(tmp_dir / f"seg_{seg_id:03d}.mp4")
-        seg_audio_path = str(tmp_dir / f"seg_{seg_id:03d}.wav")
-        seg_out_path   = str(tmp_dir / f"seg_{seg_id:03d}_out.mp4")
-        seg_std_path   = str(tmp_dir / f"seg_{seg_id:03d}_std.mp4")  # 標準化段（用來串接）
-
-        seg_vid.without_audio().write_videofile(
-            seg_video_path,
+    fixed_path = str(Path(CACHE_DIR) / (Path(candidate_video).stem + "_resized.mp4"))
+    with VideoFileClip(candidate_video) as v:
+        v = v.resize((sw, sh))
+        v.write_videofile(
+            fixed_path,
             codec="libx264",
-            audio=False,
-            fps=orig_fps,
+            fps=getattr(v, "fps", None) or getattr(v.reader, "fps", None) or 30.0,
             logger=None,
-            ffmpeg_params=x264_hq  # 【修改】高畫質
+            ffmpeg_params=["-crf", "14", "-preset", "slow", "-pix_fmt", "yuv420p",
+                           "-profile:v", "high", "-level", "4.2", "-movflags", "+faststart"]
         )
+    return fixed_path
 
-        # 只做 pad：夾取可用音訊 + 補靜音
-        a0 = min(t0, aud_dur)
-        a1 = min(t1_fixed, aud_dur)
-        if a1 > a0:
-            seg_aud = global_audio.subclipped(a0, a1)
-            pad_tail = target_dur - (a1 - a0)
-            if pad_tail > 1e-6:
-                seg_aud = concatenate_audioclips([seg_aud, _silent_audio(pad_tail, fps=silence_sr)])
-        else:
-            seg_aud = _silent_audio(target_dur, fps=silence_sr)
+def mux_mp4_with_copy(video_src: str, audio_src: str, out_mp4: str, sr: int = 44100, audio_bitrate: str = "192k"):
+    """
+    用 ffmpeg 將 video(copy) + audio(aac) 合併（不重編碼視訊，零畫質損失）。
+    """
+    Path(out_mp4).parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_src,
+        "-i", audio_src,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", audio_bitrate, "-ar", str(sr),
+        "-movflags", "+faststart",
+        "-shortest",
+        out_mp4
+    ]
+    subprocess.run(cmd, check=True)
 
-        # lipsync 與 base_clip（video-only）
-        if has_face:
-            seg_aud.write_audiofile(seg_audio_path, fps=silence_sr, logger=None)
-            lip.sync(seg_video_path, seg_audio_path, seg_out_path)
-            base_clip = VideoFileClip(seg_out_path).without_audio()
-        else:
-            base_clip = VideoFileClip(seg_video_path).without_audio()
+def _ensure_silent_wav_if_needed(audio_path: Path, filename_stem: str, duration_sec: float = 1.0, sr: int = 44100):
+    """
+    若音檔不存在且檔名以 'Blank' 開頭，建立 1 秒靜音 WAV。
+    """
+    if audio_path.exists():
+        return
+    if filename_stem.lower().startswith("blank"):
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        # 用 AudioArrayClip 產生靜音檔（避免函式型 Clip 的浮點誤差）
+        nsamp = max(1, int(np.floor(duration_sec * sr)))
+        arr = np.zeros((nsamp, 2), dtype=np.float32)
+        AudioArrayClip(arr, fps=sr).write_audiofile(str(audio_path), fps=sr, logger=None)
+        print(f"[INFO] Created 1s silent wav: {audio_path}")
 
-        # 【新增】確保 lipsync 輸出的解析度與原段一致（避免被縮小）
-        try:
-            src_w, src_h = seg_vid.size
-            out_w, out_h = base_clip.size
-            if (out_w, out_h) != (src_w, src_h):
-                base_clip = base_clip.resize((src_w, src_h))
-        except Exception:
-            pass
 
-        # 三者最小值決定安全長度
-        base_dur = float(base_clip.duration) if base_clip.duration else 0.0
-        safe_seg_dur = max(0.0, min(target_dur, float(seg_aud.duration), base_dur) - eps_t)
-        if safe_seg_dur <= 0:
-            base_clip.close()
-            seg_vid.close()
-            continue
+def build_audio_aligned_to_video(
+    video_path: str,
+    audio_path: str,
+    out_wav_path: str,
+    start_offset_sec: float = 0.0,
+    sr: int = 44100
+) -> str:
+    """
+    生成一條「長度精準（樣本級）」且「比影片少 1ms」的 WAV：
+      - 前置 start_offset_sec 的靜音
+      - 接上原始音檔（超過剩餘長度就截斷）
+      - 不足的補尾端靜音
+    全程用 NumPy 組裝，避免 MoviePy 內部浮點長度累積誤差。
+    """
+    # 影片長度（秒）
+    with VideoFileClip(video_path) as v:
+        vid_dur = float(v.duration)
 
-        # 對齊段長
-        base_clip = base_clip.with_duration(safe_seg_dur)
+    # 目標長度：故意比影片短 1ms，避免越界
+    safety = 1e-3
+    target_samples = max(1, int(np.floor((vid_dur - safety) * sr)))
 
-        # ⭐ 用新 AudioFileClip 以避免 NoneType stdout
-        if has_face:
-            seg_aud_clip = AudioFileClip(seg_audio_path).with_duration(safe_seg_dur)
-        else:
-            tmp_pad_wav = str(tmp_dir / f"seg_{seg_id:03d}_pad.wav")
-            seg_aud.with_duration(safe_seg_dur).write_audiofile(tmp_pad_wav, fps=silence_sr, logger=None)
-            seg_aud_clip = AudioFileClip(tmp_pad_wav).with_duration(safe_seg_dur)
+    # 讀音檔為指定取樣率、浮點 [-1, 1]
+    with AudioFileClip(audio_path) as a0:
+        y = a0.to_soundarray(fps=sr)  # (N, C) float (-1,1)
+    if y.ndim == 1:
+        y = y[:, None]
+    # 統一用立體聲
+    if y.shape[1] == 1:
+        y = np.repeat(y, 2, axis=1)
+    elif y.shape[1] > 2:
+        y = y[:, :2]
+    y = y.astype(np.float32, copy=False)
 
-        # 合成本段並重編碼成高畫質 CFR（鎖 fps）
-        combined = base_clip.with_audio(seg_aud_clip).with_fps(orig_fps)
-        combined.write_videofile(
-            seg_std_path,
+    # 計算各段樣本數
+    head_samples   = max(0, int(round(start_offset_sec * sr)))
+    remain_samples = max(0, target_samples - head_samples)
+    a0_samples     = min(len(y), remain_samples)
+
+    # 組裝輸出：固定精確 target_samples
+    out = np.zeros((target_samples, 2), dtype=np.float32)
+    if a0_samples > 0:
+        out[head_samples:head_samples + a0_samples, :] = y[:a0_samples, :2]
+
+    # 寫檔（長度=target_samples/sr，重讀時不會顯示成 3.930000）
+    Path(out_wav_path).parent.mkdir(parents=True, exist_ok=True)
+    AudioArrayClip(out, fps=sr).write_audiofile(out_wav_path, fps=sr, logger=None)
+    return out_wav_path
+
+# ----------------------------
+# 視訊輸出
+# ----------------------------
+def write_mp4_aac(
+        video_path: str, audio_path: str, out_file: str,
+        fps: float | None = None, crf: int = 14, preset: str = "slow",
+        sr: int = 44100
+    ):
+    """
+    高品質 MP4 (H.264 + AAC) 重編碼輸出。
+    """
+    temp_audio = str(CACHE_DIR / "temp_audio.m4a")
+    with VideoFileClip(video_path) as v, AudioFileClip(audio_path) as a:
+        _fps = fps or getattr(v, "fps", None) or getattr(v.reader, "fps", None) or 30.0
+        a = a.with_fps(sr)
+        v_final = v.with_audio(a).with_duration(float(v.duration)).with_fps(_fps)
+        v_final.write_videofile(
+            out_file,
             codec="libx264",
             audio_codec="aac",
-            fps=orig_fps,
+            fps=_fps,
             logger=None,
-            audio_bitrate="192k",     # 【新增】音訊品質
-            ffmpeg_params=x264_hq     # 【修改】高畫質
+            temp_audiofile=temp_audio,
+            remove_temp=True,
+            ffmpeg_params=[
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-preset", preset,
+                "-crf", str(crf),
+                "-profile:v", "high",
+                "-level", "4.2",
+                "-g", str(int(round(_fps * 2))),
+                "-bf", "2",
+                "-b_strategy", "1",
+                "-sc_threshold", "40",
+            ],
         )
 
-        # 讀回標準段加入串接清單
-        std_clip = VideoFileClip(seg_std_path)
-        if isfinite(float(std_clip.duration or 0)):
-            std_clip = std_clip.with_duration(max(0.0, float(std_clip.duration) - eps_t))
-        out_clips.append(std_clip)
-
-        # 以「重編碼後段落」實際幀數累加
-        enc_frames = int(round(float(std_clip.duration) * orig_fps))
-        total_frames += enc_frames
-
-        # 關掉暫存 clip
-        seg_aud_clip.close()
-        base_clip.close()
-        combined.close()
-        seg_vid.close()
-
-    # 串接
-    if not out_clips:
-        v.close(); global_audio.close()
-        raise RuntimeError("No output clips produced. Check face detection runs.")
-    final = concatenate_videoclips(out_clips, method="chain")
-
-    # 以實際幀數估計期望長度，上限為原片長；略縮 epsilon
-    expected_dur = (total_frames / orig_fps)
-    target_final = max(0.0, min(expected_dur, vid_dur) - eps_t)
-    final = final.with_duration(target_final)
-
-    # 最終音訊（pad）
-    if aud_dur >= target_final:
-        final_audio = global_audio.subclipped(0, target_final)
-    else:
-        head = global_audio.subclipped(0, aud_dur)
-        tail = _silent_audio(target_final - aud_dur, fps=silence_sr)
-        final_audio = concatenate_audioclips([head, tail])
-
-    final = final.with_audio(final_audio)
-
-    # 最終輸出：高畫質 CFR
-    final.write_videofile(
-        output_file,
-        codec="libx264",
-        audio_codec="aac",
-        fps=orig_fps,
-        logger=None,
-        audio_bitrate="192k",            # 【新增】音訊品質
-        ffmpeg_params=x264_hq + ["-movflags", "+faststart"]  # 【修改】高畫質 + 快速起播
+def run_lipsync_to_tmp(face_video: str, audio_file: str, tmp_out_video: str, device: str = "cuda"):
+    lip = LipSync(
+        model='wav2lip',
+        checkpoint_path='weights/wav2lip_gan.pth',
+        nosmooth=True,
+        device=device,
+        cache_dir=str(CACHE_DIR),
+        img_size=96,
+        save_cache=True,
+        static=True,           # ★ 只在第一幀偵測人臉，後面沿用
+        pads=(0, 10, 0, 0),    # ★ 視情況給上邊界留一點空間，避免嘴巴被裁
     )
+    lip.sync(face_video, audio_file, tmp_out_video)
 
-    # 清理
-    v.close()
-    global_audio.close()
-    for c in out_clips:
-        c.close()
-    final.close()
+
+def export_mp4_only(
+        video_src: str,
+        audio_src: str,
+        out_mp4: str,
+        crf_mp4: int = 14,
+        preset_mp4: str = "slow",
+        prefer_copy_video: bool = False
+    ):
+    """
+    prefer_copy_video=True → ffmpeg stream copy（不重編碼視訊）
+    否則 → moviepy 重編碼（可控 CRF）
+    """
+    if prefer_copy_video:
+        mux_mp4_with_copy(video_src, audio_src, out_mp4)
+        return
+
+    fps, _ = _get_video_props(video_src)
+    write_mp4_aac(video_src, audio_src, out_mp4, fps=fps, crf=crf_mp4, preset=preset_mp4)
+
+# ----------------------------
+# 主流程
+# ----------------------------
+@timer
+def main(tasks, source: str, face_root_path: Path, lipsync_root_path: Path):
+    for t in tasks:
+        part = t["part"]
+        filename = t["filename"]
+        offset_sec = float(t.get("offset", 0.0))
+        do_lipsync = bool(t.get("lipsync", True))
+
+        video_name = f"{source}_{part}_{filename}.mp4"
+        audio_name = f"tts_{filename}.wav"
+
+        face  = face_root_path / "output" / source / video_name
+        audio = lipsync_root_path / "ori" / "audio" / audio_name
+
+        _ensure_silent_wav_if_needed(audio, filename, duration_sec=1.0, sr=44100)
+
+        # Output path
+        out_dir = lipsync_root_path / "output" / source
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_mp4 = out_dir / f"lipsync_{source}_{part}_{filename}.mp4"
+
+        if not face.exists():
+            raise FileNotFoundError(f"face video not found: {face}")
+        if not audio.exists():
+            raise FileNotFoundError(f"audio file not found: {audio}")
+
+        # 以「樣本級對齊」方式產生 padded_wav（保證比影片短 1ms）
+        padded_wav = build_audio_aligned_to_video(
+            video_path=str(face),
+            audio_path=str(audio),
+            out_wav_path=str(CACHE_DIR / f"tmp_{part}_{filename}.wav"),
+            start_offset_sec=offset_sec,
+            sr=44100,
+        )
+
+        # === 無語音 → 用「純靜音」作為驅動跑 Wav2Lip（畫面照動、嘴巴閉合），再把 padded_wav mux 回去 ===
+        silent = not audio_has_speech(padded_wav, sr=16000,
+                                      frame_ms=30, hop_ms=15,
+                                      db_threshold=-45.0,
+                                      min_speech_ratio=0.10)
+
+        if silent:
+            driver_sil = str(CACHE_DIR / f"drv_sil_{part}_{filename}.wav")
+            make_silence_wav_for_video(str(face), driver_sil, sr=44100)
+
+            tmp_video = str(CACHE_DIR / f"tmp_sil_{part}_{filename}.mp4")
+            run_lipsync_to_tmp(str(face), driver_sil, tmp_video, device="cuda")  # or "cpu"
+
+            fixed_tmp = _ensure_same_resolution(str(face), tmp_video)
+            export_mp4_only(fixed_tmp, padded_wav, str(out_mp4),
+                            crf_mp4=12, preset_mp4="slow",
+                            prefer_copy_video=False)
+            continue
+        # 有語音時
+        if do_lipsync:
+            tmp_video = str(CACHE_DIR / f"tmp_{part}_{filename}.mp4")
+            run_lipsync_to_tmp(str(face), padded_wav, tmp_video, device="cuda")  # or "cpu"
+            fixed_tmp = _ensure_same_resolution(str(face), tmp_video)
+            export_mp4_only(fixed_tmp, padded_wav, str(out_mp4),
+                            crf_mp4=12, preset_mp4="slow",
+                            prefer_copy_video=False)
+        else:
+            export_mp4_only(str(face), padded_wav, str(out_mp4),
+                            crf_mp4=14, preset_mp4="slow",
+                            prefer_copy_video=True)
 
 if __name__ == "__main__":
-    root_path = './data/lipsync'
-    ori_path = f'{root_path}/ori'
-    out_path = f'{root_path}/output'
-    
-    face_video = f'{ori_path}/ori_Dealing_20250811.mp4'
-    audio_file = f'{ori_path}/tts_Dealing_20250811.wav'
-    output_file = f'{out_path}/lipsync_Dealing_20250811.mp4'
+    source = "clip_1"
+    face_root_path = Path("./data/image2video")
+    lipsync_root_path = Path("./data/lipsync")
 
-    lipsync_with_passthrough(face_video, audio_file, output_file)
+    # Each task is a dict: {"part": str, "filename": str, "offset": float, "lipsync": bool}
+    tasks = [
+        {"part": "part1", "filename": "NoMoreBets", "offset": 4.0, "lipsync": True},
+        {"part": "part2", "filename": "GoodLuck", "offset": 3.5, "lipsync": False},
+        {"part": "part3", "filename": "BlankCollectionCards", "offset": 0.1, "lipsync": False},  # auto-create 1s silent wav if missing
+        {"part": "transition_1_1_two_times", "filename": "PleasePlaceYourBets", "offset": 0.1, "lipsync": True},
+    ]
+
+    main(tasks, source, face_root_path, lipsync_root_path)

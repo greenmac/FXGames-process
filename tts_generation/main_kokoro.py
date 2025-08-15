@@ -123,7 +123,7 @@ def main():
         {'text': 'Please place your bets', 'start': 0.1},
         {'text': 'No more bets',           'start': 4.0},
         {'text': 'Good luck',              'start': 3.5},
-        {'text': 'Blank transition',       'start': 0.0},
+        {'text': 'Blank collection cards', 'start': 0.0},
     ]
 
     voice_list = [
