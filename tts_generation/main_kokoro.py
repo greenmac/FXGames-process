@@ -50,7 +50,7 @@ def ensure_tts_file_for_item(item: Dict, voice: str, tmp_dir: Path) -> Path:
     """
     text = item['text']
     wav_path = _unit_wav_temp_path(tmp_dir)
-    if text.startswith("Blank"):
+    if text.startswith("Silence"):
         _silence_wav(wav_path, duration_sec=1.0)
     else:
         tts_offline(text, voice, wav_path)
@@ -99,31 +99,32 @@ def main():
     output_path = Path(get_folder_path('./data', source))
 
     # If text starts with "Blank", a 1-second silence file will be created on the fly (no cache).
+    start_time = 0.1
     text_list = [
-        {'text': 'Banker 0 points',        'start': 0.1},
-        {'text': 'Banker 1 points',        'start': 0.1},
-        {'text': 'Banker 2 points',        'start': 0.1},
-        {'text': 'Banker 3 points',        'start': 0.1},
-        {'text': 'Banker 4 points',        'start': 0.1},
-        {'text': 'Banker 5 points',        'start': 0.1},
-        {'text': 'Banker 6 points',        'start': 0.1},
-        {'text': 'Banker 7 points',        'start': 0.1},
-        {'text': 'Banker 8 points',        'start': 0.1},
-        {'text': 'Banker 9 points',        'start': 0.1},
-        {'text': 'Player 0 points',        'start': 0.1},
-        {'text': 'Player 1 points',        'start': 0.1},
-        {'text': 'Player 2 points',        'start': 0.1},
-        {'text': 'Player 3 points',        'start': 0.1},
-        {'text': 'Player 4 points',        'start': 0.1},
-        {'text': 'Player 5 points',        'start': 0.1},
-        {'text': 'Player 6 points',        'start': 0.1},
-        {'text': 'Player 7 points',        'start': 0.1},
-        {'text': 'Player 8 points',        'start': 0.1},
-        {'text': 'Player 9 points',        'start': 0.1},
-        {'text': 'Please place your bets', 'start': 0.1},
-        {'text': 'No more bets',           'start': 4.0},
-        {'text': 'Good luck',              'start': 3.5},
-        {'text': 'Blank collection cards', 'start': 0.0},
+        {'text': 'Banker 0 points',          'start': start_time},
+        {'text': 'Banker 1 points',          'start': start_time},
+        {'text': 'Banker 2 points',          'start': start_time},
+        {'text': 'Banker 3 points',          'start': start_time},
+        {'text': 'Banker 4 points',          'start': start_time},
+        {'text': 'Banker 5 points',          'start': start_time},
+        {'text': 'Banker 6 points',          'start': start_time},
+        {'text': 'Banker 7 points',          'start': start_time},
+        {'text': 'Banker 8 points',          'start': start_time},
+        {'text': 'Banker 9 points',          'start': start_time},
+        {'text': 'Player 0 points',          'start': start_time},
+        {'text': 'Player 1 points',          'start': start_time},
+        {'text': 'Player 2 points',          'start': start_time},
+        {'text': 'Player 3 points',          'start': start_time},
+        {'text': 'Player 4 points',          'start': start_time},
+        {'text': 'Player 5 points',          'start': start_time},
+        {'text': 'Player 6 points',          'start': start_time},
+        {'text': 'Player 7 points',          'start': start_time},
+        {'text': 'Player 8 points',          'start': start_time},
+        {'text': 'Player 9 points',          'start': start_time},
+        {'text': 'Please place your bets',   'start': start_time},
+        {'text': 'No more bets',             'start': start_time},
+        {'text': 'Good luck',                'start': start_time},
+        {'text': 'Silence collection cards', 'start': start_time},
     ]
 
     voice_list = [
