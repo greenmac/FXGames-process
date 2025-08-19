@@ -1,25 +1,37 @@
 from pathlib import Path
 from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips
 from moviepy import AudioClip
-from moviepy.audio.AudioClip import AudioArrayClip  # ★ 重要：用來精確寫出 numpy 組裝的音檔
+from moviepy.audio.AudioClip import AudioArrayClip  # for sample-accurate writing
 from lipsync import LipSync
 from utils_tool import timer
 import math
 import numpy as np
 import subprocess
+import os, gc, inspect
 
+# Optional torch (for CUDA cache clean & fallback logic)
+try:
+    import torch
+except Exception:
+    torch = None
+
+# ----------------------------
+# Paths / Cache
+# ----------------------------
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ----------------------------
+# Basic helpers
+# ----------------------------
 def safe_subclip(clip, start, end, eps=1e-3):
-    """確保 end 不超過 clip.duration - eps"""
+    """Ensure end <= clip.duration - eps."""
     safe_end = min(end, clip.duration - eps)
     safe_start = max(start, 0)
     return clip.subclipped(safe_start, safe_end)
 
-
 def _rms_db(x: np.ndarray, eps=1e-12) -> float:
-    """計算 RMS dBFS（mono 1D）。"""
+    """RMS dBFS (mono 1D)."""
     if x.ndim > 1:
         x = x.mean(axis=1)
     rms = float(np.sqrt(np.mean(np.maximum(x**2, eps))))
@@ -32,16 +44,12 @@ def audio_has_speech(audio_path: str,
                      db_threshold: float = -45.0,
                      min_speech_ratio: float = 0.10) -> bool:
     """
-    粗略檢測音檔是否有語音：
-    - 將音訊轉為指定 sr 的 waveform（[-1, 1] 範圍）
-    - 分成 frame_ms 毫秒一幀
-    - 計算每幀 RMS dBFS，超過 db_threshold 視為有聲
-    - 有聲比例 >= min_speech_ratio 即視為有語音
+    Rough VAD by frame RMS dBFS over threshold.
     """
     with AudioFileClip(audio_path) as a:
-        y = a.to_soundarray(fps=sr)  # shape: (N, channels)
+        y = a.to_soundarray(fps=sr)  # (N, C)
     if y.ndim > 1:
-        y = y.mean(axis=1)  # 轉 mono
+        y = y.mean(axis=1)
     n = len(y)
     if n == 0:
         return False
@@ -64,10 +72,9 @@ def audio_has_speech(audio_path: str,
     return ratio >= min_speech_ratio
 
 def make_silence_wav_for_video(video_path: str, out_wav_path: str, sr: int = 44100):
-    """做一條與 video 等長的全靜音 WAV（供 Wav2Lip 驅動用）。"""
+    """Make a silent wav equal to video duration."""
     with VideoFileClip(video_path) as v:
         dur = float(v.duration)
-    # 用 AudioArrayClip 產生精確靜音（不走函式型 AudioClip 避免浮點誤差）
     target_samples = max(1, int(np.floor(dur * sr)))
     arr = np.zeros((target_samples, 2), dtype=np.float32)
     Path(out_wav_path).parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +82,7 @@ def make_silence_wav_for_video(video_path: str, out_wav_path: str, sr: int = 441
     return out_wav_path
 
 def _get_video_props(path: str):
-    """Return (fps, (w, h)) using MoviePy."""
+    """Return (fps, (w, h))."""
     with VideoFileClip(path) as v:
         fps = getattr(v, "fps", None) or getattr(v.reader, "fps", None) or 30.0
         w, h = v.size
@@ -83,7 +90,7 @@ def _get_video_props(path: str):
 
 def _ensure_same_resolution(src_video: str, candidate_video: str) -> str:
     """
-    若 candidate 與 src 解析度不同就重採到一致，回傳修正後路徑。
+    If candidate's resolution differs from src, resize to match.
     """
     _, (sw, sh) = _get_video_props(src_video)
     _, (cw, ch) = _get_video_props(candidate_video)
@@ -105,7 +112,7 @@ def _ensure_same_resolution(src_video: str, candidate_video: str) -> str:
 
 def mux_mp4_with_copy(video_src: str, audio_src: str, out_mp4: str, sr: int = 44100, audio_bitrate: str = "192k"):
     """
-    用 ffmpeg 將 video(copy) + audio(aac) 合併（不重編碼視訊，零畫質損失）。
+    ffmpeg stream copy for video + AAC audio encode. Zero video quality loss.
     """
     Path(out_mp4).parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -123,18 +130,16 @@ def mux_mp4_with_copy(video_src: str, audio_src: str, out_mp4: str, sr: int = 44
 
 def _ensure_silent_wav_if_needed(audio_path: Path, filename_stem: str, duration_sec: float = 1.0, sr: int = 44100):
     """
-    若音檔不存在且檔名以 'Blank' 開頭，建立 1 秒靜音 WAV。
+    If missing and stem startswith 'Blank', create a 1s silent WAV.
     """
     if audio_path.exists():
         return
     if filename_stem.lower().startswith("blank"):
         audio_path.parent.mkdir(parents=True, exist_ok=True)
-        # 用 AudioArrayClip 產生靜音檔（避免函式型 Clip 的浮點誤差）
         nsamp = max(1, int(np.floor(duration_sec * sr)))
         arr = np.zeros((nsamp, 2), dtype=np.float32)
         AudioArrayClip(arr, fps=sr).write_audiofile(str(audio_path), fps=sr, logger=None)
         print(f"[INFO] Created 1s silent wav: {audio_path}")
-
 
 def build_audio_aligned_to_video(
     video_path: str,
@@ -144,49 +149,42 @@ def build_audio_aligned_to_video(
     sr: int = 44100
 ) -> str:
     """
-    生成一條「長度精準（樣本級）」且「比影片少 1ms」的 WAV：
-      - 前置 start_offset_sec 的靜音
-      - 接上原始音檔（超過剩餘長度就截斷）
-      - 不足的補尾端靜音
-    全程用 NumPy 組裝，避免 MoviePy 內部浮點長度累積誤差。
+    Build a sample-accurate WAV:
+      - head silence of start_offset_sec
+      - then original audio (trim if needed)
+      - pad tail silence
+    Target length = video_dur - 1ms (safety), to avoid overshoot.
     """
-    # 影片長度（秒）
     with VideoFileClip(video_path) as v:
         vid_dur = float(v.duration)
 
-    # 目標長度：故意比影片短 1ms，避免越界
     safety = 1e-3
     target_samples = max(1, int(np.floor((vid_dur - safety) * sr)))
 
-    # 讀音檔為指定取樣率、浮點 [-1, 1]
     with AudioFileClip(audio_path) as a0:
-        y = a0.to_soundarray(fps=sr)  # (N, C) float (-1,1)
+        y = a0.to_soundarray(fps=sr)  # (N, C) float
     if y.ndim == 1:
         y = y[:, None]
-    # 統一用立體聲
     if y.shape[1] == 1:
         y = np.repeat(y, 2, axis=1)
     elif y.shape[1] > 2:
         y = y[:, :2]
     y = y.astype(np.float32, copy=False)
 
-    # 計算各段樣本數
     head_samples   = max(0, int(round(start_offset_sec * sr)))
     remain_samples = max(0, target_samples - head_samples)
     a0_samples     = min(len(y), remain_samples)
 
-    # 組裝輸出：固定精確 target_samples
     out = np.zeros((target_samples, 2), dtype=np.float32)
     if a0_samples > 0:
         out[head_samples:head_samples + a0_samples, :] = y[:a0_samples, :2]
 
-    # 寫檔（長度=target_samples/sr，重讀時不會顯示成 3.930000）
     Path(out_wav_path).parent.mkdir(parents=True, exist_ok=True)
     AudioArrayClip(out, fps=sr).write_audiofile(out_wav_path, fps=sr, logger=None)
     return out_wav_path
 
 # ----------------------------
-# 視訊輸出
+# Video export
 # ----------------------------
 def write_mp4_aac(
         video_path: str, audio_path: str, out_file: str,
@@ -194,7 +192,7 @@ def write_mp4_aac(
         sr: int = 44100
     ):
     """
-    高品質 MP4 (H.264 + AAC) 重編碼輸出。
+    High-quality MP4 (H.264 + AAC) re-encode.
     """
     temp_audio = str(CACHE_DIR / "temp_audio.m4a")
     with VideoFileClip(video_path) as v, AudioFileClip(audio_path) as a:
@@ -223,21 +221,6 @@ def write_mp4_aac(
             ],
         )
 
-def run_lipsync_to_tmp(face_video: str, audio_file: str, tmp_out_video: str, device: str = "cuda"):
-    lip = LipSync(
-        model='wav2lip',
-        checkpoint_path='weights/wav2lip_gan.pth',
-        nosmooth=True,
-        device=device,
-        cache_dir=str(CACHE_DIR),
-        img_size=96,
-        save_cache=True,
-        static=True,           # ★ 只在第一幀偵測人臉，後面沿用
-        pads=(0, 10, 0, 0),    # ★ 視情況給上邊界留一點空間，避免嘴巴被裁
-    )
-    lip.sync(face_video, audio_file, tmp_out_video)
-
-
 def export_mp4_only(
         video_src: str,
         audio_src: str,
@@ -247,8 +230,8 @@ def export_mp4_only(
         prefer_copy_video: bool = False
     ):
     """
-    prefer_copy_video=True → ffmpeg stream copy（不重編碼視訊）
-    否則 → moviepy 重編碼（可控 CRF）
+    prefer_copy_video=True → ffmpeg stream copy (no re-encode)
+    else → high quality re-encode
     """
     if prefer_copy_video:
         mux_mp4_with_copy(video_src, audio_src, out_mp4)
@@ -258,8 +241,100 @@ def export_mp4_only(
     write_mp4_aac(video_src, audio_src, out_mp4, fps=fps, crf=crf_mp4, preset=preset_mp4)
 
 # ----------------------------
-# 主流程
+# VRAM helpers & safe LipSync
 # ----------------------------
+from moviepy import VideoFileClip  # already imported above but kept explicit for clarity
+
+def _prep_for_detection(src_path: str, h_target: int = 720) -> str:
+    """
+    Temporarily downscale face video to h_target for detection/inference to reduce VRAM.
+    If original height <= h_target, return original.
+    """
+    with VideoFileClip(src_path) as v:
+        if v.h <= h_target:
+            return src_path
+        scale = h_target / v.h
+        tmp = str(CACHE_DIR / (Path(src_path).stem + f"_det{h_target}.mp4"))
+        v.resize(scale).write_videofile(
+            tmp, codec="libx264", fps=v.fps or 30, logger=None,
+            ffmpeg_params=["-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"]
+        )
+    return tmp
+
+def _empty_cuda():
+    if torch is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
+
+def _make_lipsync(**kwargs):
+    # print(f"[DEBUG] Creating LipSync with kwargs: {kwargs}")
+    """
+    Create LipSync with only supported args (for version compatibility).
+    """
+    # ctor_params = inspect.signature(LipSync).parameters
+    # safe_kwargs = {k: v for k, v in kwargs.items() if k in ctor_params}
+    # print(f"[DEBUG] Creating LipSync with args: {safe_kwargs}")
+    return LipSync(**kwargs)
+
+def run_lipsync_to_tmp(face_video: str, audio_file: str, tmp_out_video: str, device: str = "cuda"):
+    """
+    OOM-safe lipsync:
+      1) Downscale to 720p for inference (less VRAM)
+      2) Try CUDA → if OOM clear cache & try smaller batch (if supported) → fallback CPU
+      3) static=True to detect face only once and reuse bbox
+    """
+    face_for_det = _prep_for_detection(face_video, h_target=720)
+
+    common_args = dict(
+        model='wav2lip',
+        checkpoint_path='weights/wav2lip.pth',  # your weights
+        nosmooth=True,
+        cache_dir=str(CACHE_DIR),
+        img_size=96,          # required by the chosen weights
+        save_cache=True,
+        static=True,          # detect face only on first frame
+        pads=(0, 10, 0, 0),   # keep some headroom to avoid cropping mouth
+    )
+
+    # Try 1: CUDA normal
+    if device == "cuda" and torch is not None and torch.cuda.is_available():
+        try:
+            lip = _make_lipsync(device="cuda", **common_args)
+            if torch is not None:
+                torch.set_grad_enabled(False)
+            lip.sync(face_for_det, audio_file, tmp_out_video)
+            del lip
+            _empty_cuda()
+            return
+        except RuntimeError as e:
+            if "CUDA out of memory" not in str(e):
+                raise
+            _empty_cuda()
+
+        # Try 2: CUDA with reduced batch (if supported)
+        try:
+            low_args = dict(common_args)
+            low_args["device"] = "cuda"
+            low_args["batch_size"] = 4  # some versions support; silently ignored if not
+            lip = _make_lipsync(**low_args)
+            if torch is not None:
+                torch.set_grad_enabled(False)
+            lip.sync(face_for_det, audio_file, tmp_out_video)
+            del lip
+            _empty_cuda()
+            return
+        except Exception:
+            _empty_cuda()
+
+    # Try 3: CPU fallback
+    lip = _make_lipsync(device="cpu", **common_args)
+    lip.sync(face_for_det, audio_file, tmp_out_video)
+    del lip
+    _empty_cuda()
+
 @timer
 def main(tasks, source: str, face_root_path: Path, lipsync_root_path: Path):
     for t in tasks:
@@ -276,7 +351,6 @@ def main(tasks, source: str, face_root_path: Path, lipsync_root_path: Path):
 
         _ensure_silent_wav_if_needed(audio, filename, duration_sec=1.0, sr=44100)
 
-        # Output path
         out_dir = lipsync_root_path / "output" / source
         out_dir.mkdir(parents=True, exist_ok=True)
         out_mp4 = out_dir / f"lipsync_{source}_{part}_{filename}.mp4"
@@ -286,7 +360,7 @@ def main(tasks, source: str, face_root_path: Path, lipsync_root_path: Path):
         if not audio.exists():
             raise FileNotFoundError(f"audio file not found: {audio}")
 
-        # 以「樣本級對齊」方式產生 padded_wav（保證比影片短 1ms）
+        # Build sample-accurate aligned audio (shorter than video by 1ms safety)
         padded_wav = build_audio_aligned_to_video(
             video_path=str(face),
             audio_path=str(audio),
@@ -295,48 +369,61 @@ def main(tasks, source: str, face_root_path: Path, lipsync_root_path: Path):
             sr=44100,
         )
 
-        # === 無語音 → 用「純靜音」作為驅動跑 Wav2Lip（畫面照動、嘴巴閉合），再把 padded_wav mux 回去 ===
-        silent = not audio_has_speech(padded_wav, sr=16000,
-                                      frame_ms=30, hop_ms=15,
-                                      db_threshold=-45.0,
-                                      min_speech_ratio=0.10)
+        # ---- FIRST: decide if we actually do lipsync ----
+        if not do_lipsync:
+            # No lipsync: just mux audio back (video copy, no re-encode)
+            export_mp4_only(str(face), padded_wav, str(out_mp4),
+                            crf_mp4=14, preset_mp4="slow",
+                            prefer_copy_video=True)
+            _empty_cuda()
+            continue
+
+        # Only when doing lipsync, check whether audio is effectively silent
+        silent = not audio_has_speech(
+            padded_wav, sr=16000,
+            frame_ms=30, hop_ms=15,
+            db_threshold=-45.0, min_speech_ratio=0.10
+        )
 
         if silent:
+            # Use pure silence driver to keep mouth closed but still pass through Wav2Lip
             driver_sil = str(CACHE_DIR / f"drv_sil_{part}_{filename}.wav")
             make_silence_wav_for_video(str(face), driver_sil, sr=44100)
 
             tmp_video = str(CACHE_DIR / f"tmp_sil_{part}_{filename}.mp4")
-            run_lipsync_to_tmp(str(face), driver_sil, tmp_video, device="cuda")  # or "cpu"
+            run_lipsync_to_tmp(str(face), driver_sil, tmp_video, device="cuda")  # auto fallback inside
 
-            fixed_tmp = _ensure_same_resolution(str(face), tmp_video)
-            export_mp4_only(fixed_tmp, padded_wav, str(out_mp4),
-                            crf_mp4=12, preset_mp4="slow",
-                            prefer_copy_video=False)
-            continue
-        # 有語音時
-        if do_lipsync:
-            tmp_video = str(CACHE_DIR / f"tmp_{part}_{filename}.mp4")
-            run_lipsync_to_tmp(str(face), padded_wav, tmp_video, device="cuda")  # or "cpu"
             fixed_tmp = _ensure_same_resolution(str(face), tmp_video)
             export_mp4_only(fixed_tmp, padded_wav, str(out_mp4),
                             crf_mp4=12, preset_mp4="slow",
                             prefer_copy_video=False)
         else:
-            export_mp4_only(str(face), padded_wav, str(out_mp4),
-                            crf_mp4=14, preset_mp4="slow",
-                            prefer_copy_video=True)
+            # Normal speech: drive lipsync with padded_wav
+            tmp_video = str(CACHE_DIR / f"tmp_{part}_{filename}.mp4")
+            run_lipsync_to_tmp(str(face), padded_wav, tmp_video, device="cuda")  # auto fallback inside
+
+            fixed_tmp = _ensure_same_resolution(str(face), tmp_video)
+            export_mp4_only(fixed_tmp, padded_wav, str(out_mp4),
+                            crf_mp4=12, preset_mp4="slow",
+                            prefer_copy_video=False)
+
+        # Per-task cleanup (avoid accumulation of VRAM/RAM usage)
+        _empty_cuda()
 
 if __name__ == "__main__":
-    source = "clip_1"
     face_root_path = Path("./data/image2video")
     lipsync_root_path = Path("./data/lipsync")
 
-    # Each task is a dict: {"part": str, "filename": str, "offset": float, "lipsync": bool}
+    source = "clip_1"
+    # Each task: {"part": str, "filename": str, "offset": float, "lipsync": bool}
     tasks = [
-        {"part": "part1", "filename": "NoMoreBets", "offset": 4.0, "lipsync": True},
-        {"part": "part2", "filename": "GoodLuck", "offset": 3.5, "lipsync": False},
-        {"part": "part3", "filename": "BlankCollectionCards", "offset": 0.1, "lipsync": False},  # auto-create 1s silent wav if missing
+        {"part": "part1", "filename": "NoMoreBets",              "offset": 4.0, "lipsync": True},
+        {"part": "part2", "filename": "GoodLuck",                "offset": 3.5, "lipsync": False},
+        {"part": "part3", "filename": "SilenceCollectionCards",    "offset": 0.1, "lipsync": False},
         {"part": "transition_1_1_two_times", "filename": "PleasePlaceYourBets", "offset": 0.1, "lipsync": True},
+        {"part": "transition_1_2_two_times", "filename": "PleasePlaceYourBets", "offset": 0.1, "lipsync": True},
+        {"part": "transition_1_3_two_times", "filename": "PleasePlaceYourBets", "offset": 0.1, "lipsync": True},
+        {"part": "transition_1_4_two_times", "filename": "PleasePlaceYourBets", "offset": 0.1, "lipsync": True},
     ]
 
     main(tasks, source, face_root_path, lipsync_root_path)

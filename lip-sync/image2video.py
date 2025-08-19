@@ -99,34 +99,41 @@ def image_to_video(image_folder: Path, output_path: Path, fps: int = 30, crf: in
 
     print(f'Exported video: {output_path}')
 
+def make_tasks(src, base_tasks, transition_parts):
+    clip_num = src.split('_')[1]
+    return base_tasks + [
+        (f'transition_{clip_num}_{p}_two_times', 'PleasePlaceYourBets')
+        for p in transition_parts
+    ]
+
+
 @timer
-def main(root_path, sources, tasks):
-    for source in sources:
-        for part, filename in tasks:
-            out_name = f'{source}_{part}_{filename}.mp4'
-            image_folder = root_path / 'ori' / source / part
-            output_path = root_path / 'output' / source / out_name
+def main(root_path, sources, base_tasks, transition_parts):
+    for src in sources:
+        for part, filename in make_tasks(src, base_tasks, transition_parts):
+            out_name = f'{src}_{part}_{filename}.mp4'
+            image_folder = root_path / 'ori' / src / part
+            output_path = root_path / 'output' / src / out_name
             image_to_video(image_folder, output_path, fps=30, crf=14, preset='medium', target_wh=None)
+
 
 if __name__ == '__main__':
     root_path = Path('./data/image2video')
 
     sources = [
-        'clip_1', 
+        # 'clip_1',
         'clip_2', 
         'clip_3', 
-        'clip_4'
+        'clip_4',
     ]
 
-    tasks = [
+    base_tasks = [
         ('part1', 'NoMoreBets'),
         ('part2', 'GoodLuck'),
-        ('part3', 'Blank_OriBankerOrPlayerWins'),
-        ('transition_1_1_two_times', 'PleasePlaceYourBets'),
-        ('transition_1_2_two_times', 'PleasePlaceYourBets'),
-        ('transition_1_3_two_times', 'PleasePlaceYourBets'),
-        ('transition_1_4_two_times', 'PleasePlaceYourBets'),
+        ('part3', 'SilenceCollectionCards'),
     ]
 
-    main(root_path, sources, tasks)
+    transition_parts = [1, 2, 3, 4]
+
+    main(root_path, sources, base_tasks, transition_parts)
 
