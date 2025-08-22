@@ -3,7 +3,7 @@ from moviepy.video.VideoClip import ImageClip
 
 def single_frame_to_video(input_path, output_path, t, duration=2.5, fps=24):
     video = VideoFileClip(input_path)
-    img_clip = video.to_ImageClip(t).with_duration(duration)
+    img_clip:VideoFileClip = video.to_ImageClip(t).with_duration(duration)
     img_clip = img_clip.with_fps(fps)
     img_clip.write_videofile(output_path, codec="libx264", fps=fps)
     video.close()

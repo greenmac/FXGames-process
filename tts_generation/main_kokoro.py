@@ -16,17 +16,14 @@ Language code reference:
 '''
 
 def _silence_wav(path: Path, duration_sec: float, sr: int = 24000):
-    """Create a silent wav file with the specified duration (in seconds)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     silence = np.zeros(int(duration_sec * sr), dtype=np.float32)
     sf.write(str(path), silence, sr)
 
 def _safe_name(text: str) -> str:
-    """TitleCase + remove spaces (safe for filenames)."""
-    return text.title().replace(' ', '')
+    return text.replace(' ', '_')
 
 def tts_offline(text: str, voice: str, output_file: Path, lang_code: str = 'a', speed: float = 1.0, sr: int = 24000):
-    """Synthesize a single utterance to a WAV file (no caching kept on disk)."""
     output_file.parent.mkdir(parents=True, exist_ok=True)
     pipe = KPipeline(lang_code=lang_code)
     gen = pipe(text, voice=voice, speed=speed)
@@ -38,29 +35,20 @@ def tts_offline(text: str, voice: str, output_file: Path, lang_code: str = 'a', 
     sf.write(str(output_file), audio_all, sr)
 
 def _unit_wav_temp_path(tmp_dir: Path) -> Path:
-    """Create a unique temporary wav path inside tmp_dir."""
     fd, name = tempfile.mkstemp(suffix=".wav", dir=str(tmp_dir))
     os.close(fd)
     return Path(name)
 
 def ensure_tts_file_for_item(item: Dict, voice: str, tmp_dir: Path) -> Path:
-    """
-    Always render this item into a fresh temporary wav and return that FILE path.
-    If text starts with 'Blank', create a 1-second silence wav instead of TTS.
-    """
     text = item['text']
     wav_path = _unit_wav_temp_path(tmp_dir)
-    if text.startswith("Silence"):
+    if text.startswith("silence"):
         _silence_wav(wav_path, duration_sec=1.0)
     else:
         tts_offline(text, voice, wav_path)
     return wav_path
 
 def build_segments_with_silence(clips: List[Sound], start_times: List[float]):
-    """
-    Given Sound objects and start times, return a list of segments for am.Concatenate,
-    automatically inserting silence (as float seconds) when needed.
-    """
     segments = []
     current_time = 0.0
     for s, st in zip(clips, start_times):
@@ -72,11 +60,6 @@ def build_segments_with_silence(clips: List[Sound], start_times: List[float]):
     return segments
 
 def make_tts_timeline(item_or_schedule: Union[Dict, List[Dict]], voice: str, out_wav: Path):
-    """
-    Accept either a single schedule item {'text': '...', 'start': 0.1}
-    or a full schedule [ {...}, {...}, ... ] and render a merged WAV.
-    All intermediate unit wavs are stored in a TemporaryDirectory and auto-deleted.
-    """
     schedule = [item_or_schedule] if isinstance(item_or_schedule, dict) else item_or_schedule
 
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -98,33 +81,34 @@ def main():
     source = 'kokoro'
     output_path = Path(get_folder_path('./data', source))
 
-    # If text starts with "Blank", a 1-second silence file will be created on the fly (no cache).
+    # If text starts with "silence", a 1-second silence file will be created on the fly (no cache).
     start_time = 0.1
     text_list = [
-        {'text': 'Banker 0 points',        'start': start_time},
-        {'text': 'Banker 1 points',        'start': start_time},
-        {'text': 'Banker 2 points',        'start': start_time},
-        {'text': 'Banker 3 points',        'start': start_time},
-        {'text': 'Banker 4 points',        'start': start_time},
-        {'text': 'Banker 5 points',        'start': start_time},
-        {'text': 'Banker 6 points',        'start': start_time},
-        {'text': 'Banker 7 points',        'start': start_time},
-        {'text': 'Banker 8 points',        'start': start_time},
-        {'text': 'Banker 9 points',        'start': start_time},
-        {'text': 'Player 0 points',        'start': start_time},
-        {'text': 'Player 1 points',        'start': start_time},
-        {'text': 'Player 2 points',        'start': start_time},
-        {'text': 'Player 3 points',        'start': start_time},
-        {'text': 'Player 4 points',        'start': start_time},
-        {'text': 'Player 5 points',        'start': start_time},
-        {'text': 'Player 6 points',        'start': start_time},
-        {'text': 'Player 7 points',        'start': start_time},
-        {'text': 'Player 8 points',        'start': start_time},
-        {'text': 'Player 9 points',        'start': start_time},
-        {'text': 'Please place your bets', 'start': start_time},
-        {'text': 'No more bets',           'start': start_time},
-        {'text': 'Good luck',              'start': start_time},
-        {'text': 'Silence',                'start': start_time},
+        {'text': 'banker 0 points',        'start': start_time},
+        {'text': 'banker 1 points',        'start': start_time},
+        {'text': 'banker 2 points',        'start': start_time},
+        {'text': 'banker 3 points',        'start': start_time},
+        {'text': 'banker 4 points',        'start': start_time},
+        {'text': 'banker 5 points',        'start': start_time},
+        {'text': 'banker 6 points',        'start': start_time},
+        {'text': 'banker 7 points',        'start': start_time},
+        {'text': 'banker 8 points',        'start': start_time},
+        {'text': 'banker 9 points',        'start': start_time},
+        {'text': 'player 0 points',        'start': start_time},
+        {'text': 'player 1 points',        'start': start_time},
+        {'text': 'player 2 points',        'start': start_time},
+        {'text': 'player 3 points',        'start': start_time},
+        {'text': 'player 4 points',        'start': start_time},
+        {'text': 'player 5 points',        'start': start_time},
+        {'text': 'player 6 points',        'start': start_time},
+        {'text': 'player 7 points',        'start': start_time},
+        {'text': 'player 8 points',        'start': start_time},
+        {'text': 'player 9 points',        'start': start_time},
+        {'text': 'please place your bets', 'start': start_time},
+        {'text': 'no more bets',           'start': start_time},
+        {'text': 'open cards',             'start': start_time},
+        {'text': 'good luck',             'start': start_time},
+        {'text': 'silence',                'start': start_time},
     ]
 
     voice_list = [
