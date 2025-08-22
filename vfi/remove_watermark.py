@@ -1,5 +1,4 @@
 import subprocess
-from pathlib import Path
 
 def remove_watermark(input_file: str, output_file: str,
                      x: int, y: int, w: int, h: int, show: int = 0):
@@ -23,8 +22,10 @@ def remove_watermark(input_file: str, output_file: str,
     subprocess.run(cmd, check=True)
 
 if __name__ == "__main__":
-    input_path = "clip_1_close_flat_hand.mp4"
-    output_path = "clip_1_close_flat_hand_no_watermark.mp4"
+    root_path = './data'
+    remove_watermark_path = f'{root_path}/remove_watermark'
+    input_path = f"{remove_watermark_path}/clip_1_close_flat_hand.mp4"
+    output_path = f"{remove_watermark_path}/clip_1_close_flat_hand_no_watermark.mp4"
 
     remove_watermark(input_path, output_path,
                      x=1600, y=925, w=300, h=110, show=0)
