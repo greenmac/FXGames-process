@@ -1,4 +1,3 @@
-from image2video import image_to_video
 from moviepy import VideoFileClip
 from pathlib import Path
 from utils_tool import timer
@@ -7,8 +6,6 @@ import shlex
 import soundfile as sf
 import subprocess
 import tempfile
-
-DEFAULT_FPS = 30  # 一律固定 30fps 輸出
 
 # ----------------------------
 # 基本工具
@@ -54,50 +51,6 @@ def _ffmpeg_resample(in_path: Path, out_path: Path, target_sr: int):
         str(out_path),
     ]
     run(cmd)
-
-# ----------------------------
-# 用 MoviePy 合成輸出（固定 30fps）
-# ----------------------------
-def mux_with_moviepy(
-    video_src: Path,
-    audio_wav: Path,
-    out_mp4: Path,
-    *,
-    fps: int = DEFAULT_FPS,     # 固定 30fps
-    crf: int = 14,
-    preset: str = "medium",
-    audio_bitrate: str = "192k",
-    audio_fps: int = 44100,
-):
-    """
-    用 MoviePy 重新封裝（會重編碼）：
-    - 視訊: libx264, CRF, preset，固定 fps
-    - 音訊: AAC, 指定 bitrate
-    - +faststart
-    """
-    from moviepy import VideoFileClip, AudioFileClip
-
-    out_mp4.parent.mkdir(parents=True, exist_ok=True)
-
-    with VideoFileClip(str(video_src)) as v:
-        a = AudioFileClip(str(audio_wav), fps=audio_fps)
-        v2 = v.with_audio(a)
-
-        v2.write_videofile(
-            str(out_mp4),
-            codec="libx264",
-            # audio_codec="aac",
-            audio_bitrate=audio_bitrate,
-            fps=fps,  # 一律固定 30fps
-            ffmpeg_params=[
-                "-crf", str(crf),
-                "-preset", preset,
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "high",
-                "-level", "4.1",
-                "-movflags", "+faststart",
-            ],
-        )
 
 # ----------------------------
 # 音訊對齊/合成
@@ -147,6 +100,32 @@ def build_aligned_audio_wav(
     sf.write(str(out_wav), out, sr)
     return out_wav
 
+def mux_copy_video_aac_audio(
+    video_src: Path,
+    audio_wav: Path,
+    out_mp4: Path,
+    *,
+    sr: int = 44100,
+    audio_bitrate: str = '192k'
+):
+    """
+    視訊使用 stream copy（零畫質損失），音訊編成 AAC，並加 faststart。
+    注意：這只保證沿用來源視訊編碼。若要所有輸出編碼一致，請搭配 _normalize_video()。
+    """
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', str(video_src),
+        '-i', str(audio_wav),
+        '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', audio_bitrate, '-ar', str(sr),
+        '-movflags', '+faststart',
+        '-shortest',
+        str(out_mp4),
+    ]
+    run(cmd)
+
 # ----------------------------
 # LatentSync 推理（你原本的腳本）
 # ----------------------------
@@ -181,7 +160,29 @@ def run_latentsync_inference(
     run(cmd)
 
 # ----------------------------
-# 單支影片處理（固定 30fps 輸出）
+# 視訊編碼「正規化」：統一規格
+# ----------------------------
+def _normalize_video(in_mp4: Path, out_mp4: Path, *, fps: int = 30):
+    """
+    統一輸出視訊規格（同時移除任何內建音軌）：
+      - H.264 libx264, CRF 18, preset medium
+      - yuv420p, High@4.1
+      - +faststart
+    """
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', str(in_mp4),
+        '-an',  # 移除音軌，之後用我們對齊好的音訊再合
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+        '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '4.1',
+        '-r', str(fps),
+        '-movflags', '+faststart',
+        str(out_mp4),
+    ]
+    run(cmd)
+
+# ----------------------------
+# 單支影片處理
 # ----------------------------
 def process_one(
     video_path: str,
@@ -190,7 +191,7 @@ def process_one(
     do_lipsync: bool,
     audio_start_offset_sec: float = 0.0,
     sr: int = 44100,
-    close_mouth_if_silent: bool = True,  # 保留參數但不使用
+    close_mouth_if_silent: bool = True,  # 這參數留著也行，但下面會直接忽略
 ):
     video_p = Path(video_path)
     audio_p = Path(audio_path)
@@ -207,29 +208,25 @@ def process_one(
             sr=sr,
         )
 
-        # 只要 do_lipsync=False，一律不跑 LatentSync；直接 MoviePy 寫檔（固定 30fps）
+        # === 早退規則：只要 do_lipsync=False，一律不跑 LatentSync ===
         if not do_lipsync:
-            mux_with_moviepy(
-                video_p, aligned_wav, out_p,
-                fps=DEFAULT_FPS, crf=14, preset="medium",
-                audio_bitrate="192k", audio_fps=sr
-            )
+            # 保持輸出影片編碼一致：先 normalize 視訊、再合成音訊
+            tmp_norm = tmp_dir / "norm.mp4"
+            _normalize_video(video_p, tmp_norm)
+            mux_copy_video_aac_audio(tmp_norm, aligned_wav, out_p, sr=sr)
             print(f"[PASS] No lipsync. Muxed aligned audio (silent={is_silent_wav(aligned_wav)}).")
             return
 
-        # lipsync=True 的流程：先做推理，再用 MoviePy 輸出（固定 30fps）
+        # ===== 以下保留原本做 lipsync=True 的流程 =====
         tmp_synced = tmp_dir / "lipsynced_raw.mp4"
         run_latentsync_inference(
             video_path=video_p,
             audio_path=aligned_wav,
             output_path=tmp_synced,
         )
-
-        mux_with_moviepy(
-            tmp_synced, aligned_wav, out_p,
-            fps=DEFAULT_FPS, crf=18, preset="medium",
-            audio_bitrate="192k", audio_fps=sr
-        )
+        tmp_norm = tmp_dir / "lipsynced_norm.mp4"
+        _normalize_video(tmp_synced, tmp_norm)
+        mux_copy_video_aac_audio(tmp_norm, aligned_wav, out_p, sr=sr)
 
     print(f'[OK] Saved → {out_p}')
 
@@ -314,6 +311,7 @@ def get_tasks(
 ):
     return [
         {
+            'idx': '',
             'filename': 'part1_draw_cards',
             'offset_sec': [
                 {'start': offset_silence_draw_cards, 'tts_content': 'draw_cards'},
@@ -322,6 +320,7 @@ def get_tasks(
             'do_mute': do_mute_silence_draw_cards,
         },
         {
+            'idx': '',
             'filename': 'part2_open_cards',
             'offset_sec': [
                 {'start': offset_open_cards, 'tts_content': 'open_cards'},
@@ -330,6 +329,7 @@ def get_tasks(
             'do_mute': do_mute_open_cards,
         },
         {
+            'idx': '',
             'filename': 'part3_collect_cards',
             'offset_sec': [
                 {'start': offset_silence_collect_cards, 'tts_content': 'collect_cards'},
@@ -343,23 +343,23 @@ def get_tasks(
 # 批次主流程
 # ----------------------------
 @timer
-def main(all_jobs, images_path, video_path, ori_root_path, output_lipsync_root_path):
+def main(all_jobs, ori_root_path, output_lipsync_root_path):
     for job in all_jobs:
         source = job['source']
         tasks = job['tasks']
 
         # 允許 tasks 是 list 或單一 dict
         tasks_iter = [tasks] if isinstance(tasks, dict) else tasks
-        
 
         for t in tasks_iter:
+            idx = t.get('idx', '')
             filename = t['filename']
             offset_sec = t['offset_sec']   # 可能是 float 或 list[dict]
             do_lipsync = t['do_lipsync']
             do_mute = t['do_mute']
 
-            video_name = f'{source}_{filename}.mp4'
-            output_name = f'lipsync_{source}_{filename}.mp4'
+            video_name = f'{source}_{idx}_{filename}.mp4' if idx else f'{source}_{filename}.mp4'
+            output_name = f'lipsync_{source}_{idx}_{filename}.mp4' if idx else f'lipsync_{source}_{filename}.mp4'
 
             video_path  = ori_root_path / 'video' / video_name
             audio_dir   = ori_root_path / 'audio'
@@ -423,8 +423,6 @@ def main(all_jobs, images_path, video_path, ori_root_path, output_lipsync_root_p
 # ----------------------------
 if __name__ == '__main__':
     root_path = Path('./data')
-    images_path = root_path / 'image2video'
-    video_path = root_path / 'ori' / 'video'
     ori_root_path = Path(f'{root_path}/ori')
     output_lipsync_root_path = Path(f'{root_path}/output_lipsync')
 
@@ -464,6 +462,7 @@ if __name__ == '__main__':
         {
             "source": "clip",
             "tasks": {
+                'idx': '',
                 'filename': 'game_start',
                 'offset_sec': [
                     {'start': 0.1, 'tts_content': 'please_place_your_bets'},
@@ -476,6 +475,7 @@ if __name__ == '__main__':
         {
             "source": "clip",
             "tasks": {
+                'idx': '',
                 'filename': 'loop',
                 'offset_sec': [
                     {'start': 0.0, 'tts_content': 'silence'},
@@ -485,4 +485,4 @@ if __name__ == '__main__':
             },
         },
     ]
-    main(all_jobs, images_path, video_path, ori_root_path, output_lipsync_root_path)
+    main(all_jobs, ori_root_path, output_lipsync_root_path)

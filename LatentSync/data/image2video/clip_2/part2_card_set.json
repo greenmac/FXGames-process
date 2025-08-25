@@ -1,0 +1,14 @@
+[
+    {
+        "interval": [0, 40],
+        "label": "tools/card_set_1"
+    },
+    {
+        "interval": [41, 307],
+        "label": "tools/card_set_2"
+    },
+    {
+        "interval": [308, 313],
+        "label": "tools/card_set_1"
+    }
+]
